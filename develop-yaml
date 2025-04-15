@@ -1,0 +1,289 @@
+trigger:
+- main
+- develop
+- releases/*
+
+pool:
+  vmImage: macos-15
+  
+variables:
+  enable.iOS: $[coalesce(variables['EnableBuild.iOS'], true)]
+  enable.Android: $[coalesce(variables['EnableBuild.Android'], true)]
+  enable.Windows: $[coalesce(variables['EnableBuild.Windows'], true)]
+
+  # Release configurations include: develop, main, releases/*
+  # NOTE: SourceBranchName does not include any pathing info (e.g. 'releases/release-43' -> 'release-43')
+  ${{ if or(startsWith(variables['Build.SourceBranchName'], 'release'), eq(variables['Build.SourceBranchName'], 'main'), eq(variables['Build.SourceBranchName'], 'develop')) }}:
+    buildConfiguration: Release
+  ${{ else }}:
+    buildConfiguration: Debug
+
+  enableDbMigrations: 'true'
+
+  # Manually adjust the version number as needed for semantic versioning. Patch is auto-incremented.
+  version.Major: 2
+  version.Minor: 51
+  version.MajorMinor: '$(version.Major).$(version.Minor)'
+  version.Patch: $[counter(format('{0}.{1}', variables['version.Major'], variables['version.Minor']), 0)]
+  versionNumber: '$(version.MajorMinor).$(version.Patch)'
+  dotnetVersion: '8.x'
+
+stages:
+  - stage: SetBuildNumber
+    displayName: Set Build Number
+    jobs:
+      - job: Job
+        displayName: Set Build Number
+        steps:
+          - bash: |
+              echo '##vso[build.updatebuildnumber]$(versionNumber)'
+              printf -v minor "%03d" $(version.Minor)
+              printf -v patch "%05d" $(version.Patch)
+              echo '##vso[task.setvariable variable=Android;isoutput=true]$(version.Major)'$minor$patch
+            name: VersionCode
+
+  - stage: BuildAndroidiOS_PROD
+    dependsOn: SetBuildNumber
+    displayName: iOS & Android PROD Artifact
+    jobs:
+      - job: BuildiOSJob
+        displayName: Build iOS
+        condition: eq(variables['enable.iOS'], true)
+        variables:
+          plistFile: $(Build.SourcesDirectory)/Retread.Mobile/Platforms/iOS/Info.plist
+          doesUseEncryption: false
+          xcodeRoot: /Applications/Xcode_16.app
+        steps:
+          - task: CmdLine@2
+            displayName: Set XCode 16
+            inputs:
+                script: |
+                    echo '##vso[task.setvariable variable=MD_APPLE_SDK_ROOT;]'$(xcodeRoot)
+                    sudo xcode-select --switch $(xcodeRoot)/Contents/Developer
+
+          - task: InstallAppleCertificate@2
+            displayName: 'Install an Apple certificate'
+            inputs:
+              certSecureFile: 'IOS_Certificates_2025.p12'
+              certPwd: '$(iOS.CertPassword)'
+              setUpPartitionIdACLForPrivateKey: false
+
+          - task: InstallAppleProvisioningProfile@1
+            displayName: 'Install an Apple provisioning profile'
+            inputs:
+                provProfileSecureFile: CasingCollectionSIT2025.mobileprovision
+
+          - task: CmdLine@2
+            displayName: 'Update Info.plist'
+            inputs:
+              script: |
+                echo "Updating Info.plist: $(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $(versionNumber)" "$(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $(versionNumber)" "$(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $(iOS.BundleIdentifier.SIT)" "$(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool $(doesUseEncryption)" "$(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :CFBundleName string '$(iOS.BundleName.SIT)'" "$(plistFile)"
+                /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string '$(iOS.BundleName.SIT)'" "$(plistFile)"
+
+          - task: UseDotNet@2
+            displayName: Specify .NET Version
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: NuGetAuthenticate@1
+            displayName: 'Authenticate to BASys feed'
+                       
+          #- task: SonarCloudPrepare@2
+          #  displayName: 'Prepare analysis configuration'
+          #  inputs:
+          #    SonarCloud: 'Sonar Cloud - BASys'
+          #    organization: 'bridgestonedigital'
+          #    scannerMode: 'MSBuild'
+          #    projectKey: 'bridgestonedigital_basys-mobile-client'
+          #    projectName: 'BASys-Mobile-Client'
+          
+          # This is to workaround Azure DevOps not understanding 'workload'
+          # that is part of the new MAUI build process
+          - task: CmdLine@2
+            displayName: Restore required MAUI workloads
+            inputs:
+              script: |
+                dotnet workload install ios maui maui-ios 
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet build
+            inputs:
+              workingDirectory: 'Retread.Mobile'
+              command: 'build'
+              arguments: '-c $(buildConfiguration) -f net8.0-ios -p:RuntimeIdentifier=ios-arm64 -p:cicd=true -p:ENABLE_DB_MIGRATION=$(enableDbMigrations) -p:Version=$(versionNumber) -p:ApplicationVersion=$(version.Major) -p:ApplicationDisplayVersion=$(versionNumber) -p:CodesignKey="$(APPLE_CERTIFICATE_SIGNING_IDENTITY)" -p:CodesignProvision="$(APPLE_PROV_PROFILE_UUID)" -p:MtouchInterpreter=all -p:UseInterpreter=true -p:MtouchLink=None'
+
+          #- task: SonarCloudAnalyze@2  # Run SonarCloud analysis
+          #  displayName: 'Run SonarCloud Analysis'
+                              
+          #- task: SonarCloudPublish@2  # Publish SonarCloud analysis results
+          #  displayName: 'Publish SonarCloud Analysis Results'
+
+          - task: CmdLine@2
+            displayName: Collect files for publishing
+            inputs:
+              script: |
+                mv Retread.Mobile/bin/$(buildConfiguration)/net8.0-ios/ios-arm64/Retread.Mobile.app $(Build.ArtifactStagingDirectory)/iOS
+                cp Retread.Mobile/Platforms/iOS/Entitlements.plist $(Build.ArtifactStagingDirectory)/iOS
+
+          - task: ArchiveFiles@2
+            displayName: Zip iOS Build Files
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/iOS'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/ios-files.zip'
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish iOS package to pipeline
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/ios-files.zip'
+              artifact: 'iOSPackage'
+              publishLocation: 'pipeline'
+
+      - job: BuildAndroidJob
+        displayName: Build Android
+        condition: eq(variables['enable.Android'], true)
+        variables:
+          androidVersionCode: $[stageDependencies.SetBuildNumber.Job.outputs['VersionCode.Android']]
+        steps:
+          - task: UseDotNet@2
+            displayName: Specify .NET Version
+            inputs:
+              version: $(dotnetVersion)
+
+          - task: NuGetAuthenticate@1
+            displayName: 'Authenticate to BASys feed'
+          
+          # This is to workaround Azure DevOps not understanding 'workload'
+          # that is part of the new MAUI build process
+          - task: CmdLine@2
+            displayName: Restore required MAUI workloads
+            inputs:
+              script: |
+                dotnet workload install maui-android maui-ios 
+
+          - task: DotNetCoreCLI@2
+            displayName: dotnet build Android
+            inputs:
+              command: 'build'
+              arguments: '-c $(buildConfiguration) 
+                -f net8.0-android 
+                -p:cicd=true
+                -p:ENABLE_DB_MIGRATION=$(enableDbMigrations) 
+                -p:Version=$(versionNumber) 
+                -p:ApplicationVersion=$(androidVersionCode) 
+                -p:ApplicationDisplayVersion=$(versionNumber) 
+                -p:PublishTrimmed=false 
+                -p:AndroidEnableProfiledAot=false 
+                -p:RunAOTCompilation=false'
+              workingDirectory: 'Retread.Mobile'
+
+          - task: ArchiveFiles@2
+            displayName: Zip Android Build Files
+            inputs:
+              rootFolderOrFile: 'Retread.Mobile/bin/$(buildConfiguration)/net8.0-android'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/android-files.zip'
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Android package to pipeline
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/android-files.zip'
+              artifact: 'AndroidPackage'
+              publishLocation: 'pipeline'
+  
+  - stage: BuildWindows_PROD
+    pool:
+      vmImage: 'windows-latest'
+    dependsOn: SetBuildNumber
+    displayName: Windows PROD Artifacts
+    jobs:
+      - job: BuildWindowsJob
+        displayName: Build Windows
+        condition: eq(variables['enable.Windows'], true)
+        variables:
+          framework: net8.0-windows10.0.22621.0
+        steps:
+          - task: UseDotNet@2
+            inputs:
+              packageType: 'sdk'
+              version: $(dotnetVersion)
+
+          - task: NuGetAuthenticate@1
+            displayName: 'Authenticate to BASys feed'
+
+          - script: |
+              dotnet workload install maui-windows ios android maccatalyst
+            displayName: 'Install .NET MAUI Workloads'
+
+          - task: CmdLine@2
+            displayName: 'Publish Windows'
+            inputs:
+              script: |
+                dotnet publish -c $(buildConfiguration) -f ^
+                $(framework) ^
+                -p:cicd=true ^
+                -p:ENABLE_DB_MIGRATION=$(enableDbMigrations) ^
+                -p:Version=$(versionNumber) ^
+                -p:ApplicationVersion=$(version.Major) ^
+                -p:ApplicationDisplayVersion=$(versionNumber) ^
+              workingDirectory: 'Retread.Mobile'
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish Windows package to pipeline
+            inputs:
+              targetPath: 'Retread.Mobile/bin/$(buildConfiguration)/$(framework)/win10-x64/AppPackages'
+              artifact: 'WindowsPackage'
+              publishLocation: 'pipeline'
+
+  # SIT Stage
+  - stage: Android_Windows_SIT
+    displayName: Android-Windows SIT Artifacts
+    dependsOn: SetBuildNumber
+    variables:
+      androidVersionCode: $[stageDependencies.SetBuildNumber.Job.outputs['VersionCode.Android']]
+    jobs:
+    - template: Template/Build-Android-Windows-Template.yaml
+      parameters:
+        environment: SIT
+        dotnetVersion: $(dotnetVersion)
+        androidBundleIdentifier: $(Android.BundleIdentifier.SIT)
+        windowsIdentity: $(Windows.Identity.SIT)
+        windowsDisplayName: $(Windows.Applications.DisplayName.SIT)
+        bundleName: $(BundleName.SIT)
+        enableAndroid: variables['enable.Android']
+        enableWindows: variables['enable.Windows']
+        buildConfiguration: $(buildConfiguration)
+        version: $(versionNumber) 
+        androidApplicationVersion: $(androidVersionCode)
+        windowsApplicationVersion: $(version.Major)
+
+  # UAT Stage
+  - stage: Android_Windows_UAT
+    displayName: Android-Windows UAT Artifacts
+    dependsOn: SetBuildNumber
+    variables:
+      androidVersionCode: $[stageDependencies.SetBuildNumber.Job.outputs['VersionCode.Android']]
+    jobs:
+    - template: Template/Build-Android-Windows-Template.yaml
+      parameters:
+        environment: UAT
+        dotnetVersion: $(dotnetVersion)
+        androidBundleIdentifier: $(Android.BundleIdentifier.UAT)
+        windowsIdentity: $(Windows.Identity.UAT)
+        windowsDisplayName: $(Windows.Applications.DisplayName.UAT)
+        bundleName: $(BundleName.UAT)
+        enableAndroid: variables['enable.Android']
+        enableWindows: variables['enable.Windows']
+        buildConfiguration: $(buildConfiguration)
+        version: $(versionNumber) 
+        androidApplicationVersion: $(androidVersionCode)
+        windowsApplicationVersion: $(version.Major)
