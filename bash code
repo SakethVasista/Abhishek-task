@@ -1,0 +1,53 @@
+For below sentry issue we have to upload the dYSM file to sentry then it will show details of the issue. 
+https://bridgestone.sentry.io/issues/6256265107/?project=4508613151293440&query=is%3Aunresolved%20issue.priority%3A%5Bhigh%2C%20medium%5D%20os.name%3AiOS%20level%3Afatal&referrer=issue-stream&statsPeriod=24h&stream_index=0
+ 
+ Enable Debug symbols in .Proj File
+
+
+<!-- Enable Debug Symbols Generation -->
+<DebugSymbols>true</DebugSymbols>
+<DebugType>Full</DebugType><MtouchLink>SdkOnly</MtouchLink><CodesignSymbols>true</CodesignSymbols><SupportedArchitectures>arm64</SupportedArchitectures>
+      2. Bash script to copy dYSM files in Artififacts (Please use the path accordingly)
+ 
+ 
+
+
+echo "Searching for .dSYM files..."
+      # Ensure target directory exists
+      mkdir -p $(Build.ArtifactStagingDirectory)/dSYM
+      # Locate and copy all .dSYM files
+      find $(Agent.BuildDirectory) -name "*.dSYM" -exec cp -R {} $(Build.ArtifactStagingDirectory)/dSYM/ \;
+      echo "Copied .dSYM files to $(Build.ArtifactStagingDirectory)/dSYM"
+ 
+ 
+ 
+ 
+         3.  Install Sentry 
+ 
+     
+
+
+   curl -sL https://sentry.io/get-cli/ | bash
+ 
+     4. Upload to Sentry
+ 
+ 
+
+
+echo "Uploading .dSYM files to Sentry..."
+# Set the Sentry authentication token and project details (ensure this is securely stored in the environment)
+export SENTRY_AUTH_TOKEN=$(SENTRY_AUTH_TOKEN)
+# Set the Sentry project and org (replace these with your own values)
+export SENTRY_ORG="bridgestone"
+export SENTRY_PROJECT="toolboxtouch"
+# Ensure the sentry-cli is installed (if not installed yet in the pipeline)
+npm install -g @sentry/cli
+# Run the sentry-cli command to upload .dSYM files
+sentry-cli --auth-token $SENTRY_AUTH_TOKEN upload-dif $(Build.ArtifactStagingDirectory)/dSYM --org $SENTRY_ORG --project $SENTRY_PROJECT
+ 
+ 
+Sentry Auth token can be created here. 
+https://docs.sentry.io/account/auth-tokens/#organization-auth-tokens
+ 
+Louis Justin Nithin Francois (NCS) 
+FYI.
